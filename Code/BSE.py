@@ -2300,215 +2300,87 @@ class TraderMMM01(Trader):
     # end of MMM01 definition
 
 
+
 class TraderMMM02(Trader):
-    """
-    MMM: Minimal Market-Maker: a minimally simple trader that buys & sells to make profit
 
-    MMM02 long-only buy-and-hold strategy in pseudocode:
+    def __init__(self, ttype, tid, balance, params, time=0):
+        super().__init__(ttype, tid, balance, params, time)
 
-    1 wait until the market has been open for 5 minutes (to give prices a chance to settle)
-    2 then repeat forever:
-    2.1 if (I am not holding a unit)
-    2.1.1  and (best ask price is "cheap" -- i.e., less than average of recent transaction prices)
-    2.1.2  and (I have enough money in my bank to pay the asking price)
-    2.2 then
-    2.2.1   (buy the unit -- lift the ask)
-    2.2.2   (remember the purchase-price I paid for it)
-    2.3 else if (I am holding a unit)
-    2.4 then
-    2.4.1   (my asking-price is that unit’s purchase-price plus my profit margin)
-    2.4.1   if (best bid price is more than my asking price)
-    2.4.1   then
-    2.4.1.1    (sell my unit -- hit the bid)
-    2.4.1.2    (put the money in my bank)
-    """
+        self.base_spread = params.get('base_spread', 2)
+        self.inv_penalty = params.get('inv_penalty', 0.05)
+        self.vol_window = params.get('vol_window', 5)
 
-    def __init__(self, ttype, tid, balance, params, time):
-        """
-        Construct an MMM02 trader
-        :param ttype: the ticker-symbol for the type of trader (its strategy)
-        :param tid: the trader id
-        :param balance: the trader's bank balance
-        :param params: a dictionary of optional parameter-values to override the defaults
-        :param time: the current time.
-        """
+        self.last_prices = []
+        self.inventory = 0
+        self.lastquote = None
+        self.orders = []
 
-        Trader.__init__(self, ttype, tid, balance, params, time)
-        self.job = 'Buy'  # flag switches between 'Buy' & 'Sell'; shows what MMM02 is currently trying to do
-        self.last_purchase_price = None
-        
-        init_verbose = True
 
-        # TC 22/10/25 - set default params
-        # Default parameter-values
-        self.n_past_trades = 1      # how many recent trades used to compute average price (avg_p)?
-        self.bid_percent = 0.5      # what percentage of avg_p should best_ask be for this trader to bid
-        self.ask_delta = 25         # how much (absolute value) to improve on purchase price
+    def calc_volatility(self):
+        if len(self.last_prices) < 2:
+            return 0
+        diffs = [abs(self.last_prices[i] - self.last_prices[i - 1])
+                 for i in range(1, len(self.last_prices))]
+        return sum(diffs) / len(diffs)
 
-        # Did the caller provide different params?
-        if type(params) is dict:
-            if 'bid_percent' in params:
-                self.bid_percent = params['bid_percent']
-                if self.bid_percent > 1.0 or self.bid_percent < 0.01:
-                    sys.exit('FAIL: MM02 self.bid_percent=%f not in range [0.01,1.0])' % self.bid_percent)
-            if 'ask_delta' in params:
-                self.ask_delta = params['ask_delta']
-                if self.ask_delta < 0:
-                    sys.exit('Fail: MM02 ask_delta can\'t be negative (it\'s an absolute value)')
-            if 'n_past_trades' in params:
-                self.n_past_trades = int(round(params['n_past_trades']))
-                if self.n_past_trades < 1:
-                    sys.exit('Fail: MM02 n_past trades must be 1 or more')
-                    
-        if init_verbose:
-            print('MM02 init: n_past_trades=%d, bid_percent=%6.5f, ask_delta=%d\n' \
-                % (self.n_past_trades, self.bid_percent, self.ask_delta))
 
     def getorder(self, time, countdown, lob):
-        """
-        return this trader's order when it is polled in the main market_session loop.
-        :param time: the current time.
-        :param countdown: the time remaining until market closes (not currently used).
-        :param lob: the public lob.
-        :return: trader's new order, or None.
-        """
-        # this test for negative countdown is purely to stop PyCharm warning about unused parameter value
-        if countdown < 0:
-            sys.exit('Negative countdown')
 
-        if len(self.orders) < 1 or time < 5 * 60:
-            order = None
+        # LOB incomplete → do nothing
+        if lob['bids']['best'] is None or lob['asks']['best'] is None:
+            return None
+
+        best_bid = lob['bids']['best']
+        best_ask = lob['asks']['best']
+        mid = (best_bid + best_ask) / 2.0
+
+        self.last_prices.append(mid)
+        if len(self.last_prices) > self.vol_window:
+            self.last_prices.pop(0)
+
+        vol = self.calc_volatility()
+        spread = self.base_spread + vol
+        inv_adj = self.inv_penalty * self.inventory
+
+        bid_p = int(mid - spread/2 - inv_adj)
+        ask_p = int(mid + spread/2 - inv_adj)
+
+        bid_p = max(1, bid_p)
+        ask_p = max(1, ask_p)
+
+        if self.lastquote is None:
+            qid = 0
         else:
-            quoteprice = self.orders[0].price
-            order = Order(self.tid,
-                          self.orders[0].otype,
-                          quoteprice,
-                          self.orders[0].qty,
-                          time, lob['QID'])
-            self.lastquote = order
-        return order
+            qid = self.lastquote.qid + 1
 
-    def respond(self, time, lob, trade, vrbs):
-        """
-        Respond to the current state of the public lob.
-        Buys if best bid is less than simple moving average of recent transcaction prices.
-        Sells as soon as it can make an acceptable profit.
-        :param time: the current time
-        :param lob: the current public lob
-        :param trade:
-        :param vrbs: if True then print running commentary, else stay silent
-        :return: <nothing>
-        """
-
-        vrbs = False
-        vstr = 't=%f MM02 respond: ' % time
-
-        # what is average price of most recent n trades?
-        # work backwards from end of tape (most recent trade)
-        tape_position = -1
-        n_prices = 0
-        sum_prices = 0
-        avg_price_ok = False
-        avg_price = -1
-        while n_prices < self.n_past_trades and abs(tape_position) < len(lob['tape']):
-            if lob['tape'][tape_position]['type'] == 'Trade':
-                price = lob['tape'][tape_position]['price']
-                n_prices += 1
-                sum_prices += price
-            tape_position -= 1
-        if n_prices == self.n_past_trades:
-            # there's been enough trades to form an acceptable average
-            avg_price = int(round(sum_prices / n_prices))
-            avg_price_ok = True
-        vstr += "avg_price_ok=%s, avg_price=%d " % (avg_price_ok, avg_price)
-
-        # buying?
-        if self.job == 'Buy' and avg_price_ok:
-            vstr += 'Buying - '
-            # see what's on the LOB
-            if lob['asks']['n'] > 0:
-                # there is at least one ask on the LOB
-                best_ask = lob['asks']['best']
-                if best_ask / avg_price < self.bid_percent:
-                    # bestask is good value: send a spread-crossing bid to lift the ask
-                    bidprice = best_ask + 1
-                    if bidprice < self.balance:
-                        # can afford to buy
-                        # create the bid by issuing order to self, which will be processed in getorder()
-                        order = Order(self.tid, 'Bid', bidprice, 1, time, lob['QID'])
-                        self.orders = [order]
-                        vstr += 'Best ask=%d, bidprice=%d, order=%s ' % (best_ask, bidprice, order)
-                else:
-                    vstr += 'bestask=%d >= avg_price=%d' % (best_ask, avg_price)
-            else:
-                vstr += 'No asks on LOB'
-        # selling?
-        elif self.job == 'Sell':
-            vstr += 'Selling - '
-            # see what's on the LOB
-            if lob['bids']['n'] > 0:
-                # there is at least one bid on the LOB
-                best_bid = lob['bids']['best']
-                # sell single unit at price of purchaseprice+askdelta
-                askprice = self.last_purchase_price + self.ask_delta
-                if askprice < best_bid:
-                    # seems we have a buyer
-                    # lift the ask by issuing order to self, which will processed in getorder()
-                    order = Order(self.tid, 'Ask', askprice, 1, time, lob['QID'])
-                    self.orders = [order]
-                    vstr += 'Best bid=%d greater than askprice=%d order=%s ' % (best_bid, askprice, order)
-                else:
-                    vstr += 'Best bid=%d too low for askprice=%d ' % (best_bid, askprice)
-            else:
-                vstr += 'No bids on LOB'
-
-        self.profitpertime = self.profitpertime_update(time, self.birthtime, self.balance)
-
-        if vrbs:
-            print(vstr)
-
-    def bookkeep(self, time, trade, order, vrbs):
-        """
-        Update trader's records of its bank balance, current orders, and current job
-        :param trade: the current time
-        :param order: this trader's successful order
-        :param vrbs: if True then print a running commentary, otherwise stay silent.
-        :param time: the current time.
-        :return: <nothing>
-        """
-        vrbs = True
-
-        # output string outstr is printed if vrbs==True
-        mins = int(time//60)
-        secs = time - 60 * mins
-        hrs = int(mins//60)
-        mins = mins - 60 * hrs
-        outstr = 't=%f (%dh%02dm%02ds) %s (%s) bookkeep: orders=' % (time, hrs, mins, secs, self.tid, self.ttype)
-        for order in self.orders:
-            outstr = outstr + str(order)
-
-        self.blotter.append(trade)  # add trade record to trader's blotter
-
-        # NB What follows is **LAZY** -- assumes all orders are quantity=1
-        transactionprice = trade['price']
-        if self.orders[0].otype == 'Bid':
-            # Bid order succeeded, remember the price and adjust the balance
-            self.balance -= transactionprice
-            self.last_purchase_price = transactionprice
-            self.job = 'Sell'  # now try to sell it for a profit
-        elif self.orders[0].otype == 'Ask':
-            # Sold! put the money in the bank
-            self.balance += transactionprice
-            self.last_purchase_price = 0
-            self.job = 'Buy'  # now go back and buy another one
+        if random.random() < 0.5:
+            o = Order(self.tid, 'Bid', bid_p, 1, time, qid)
         else:
-            sys.exit('FATAL: MMM02 doesn\'t know .otype %s\n' % self.orders[0].otype)
+            o = Order(self.tid, 'Ask', ask_p, 1, time, qid)
 
-        if vrbs:
-            net_worth = self.balance + self.last_purchase_price
-            print('%s Balance=%d NetWorth=%d' % (outstr, self.balance, net_worth))
+        # required by BSE
+        self.orders = [o]
+        self.lastquote = o
 
-        self.del_order(order)  # delete the order
+        return o
+
+
+    def respond(self, time, lob, trade, verbose=False):
+        return None
+
+
+    def bookkeep(self, time, trade, order, verbose=False):
+
+        price = trade['price']
+
+        if order.otype == 'Bid':
+            self.balance -= price
+            self.inventory += 1
+        else:
+            self.balance += price
+            self.inventory -= 1
+
+        self.orders = []
 
     # end of MMM02 definition
 
@@ -3221,8 +3093,15 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
                 dump_strats_frame(time, strat_dump, traders)
                 # record that we've written this frame
                 frames_done.add(int(time))
-
         time = time + timestep
+
+    # --------------------------------------------
+    # session finished — now return traders + tape
+    # --------------------------------------------
+    return {
+        'traders': traders,
+        'tape': exchange.tape
+    }
 
     # session has ended
 
